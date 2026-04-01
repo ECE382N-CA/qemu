@@ -1474,6 +1474,21 @@ void tcg_gen_st_i32(TCGv_i32 arg1, TCGv_ptr arg2, tcg_target_long offset)
 
 /* 64-bit ops */
 
+void tcg_gen_tm_start_i64(TCGv_i64 arg)
+{
+    tcg_gen_op1_i64(INDEX_op_tm_start, TCG_TYPE_I64, arg);
+}
+
+void tcg_gen_tm_commit_i64(void)
+{
+    tcg_gen_op1i(INDEX_op_tm_commit, 0, 0);
+}
+
+void tcg_gen_tm_cancel_i64(int64_t arg)
+{
+    tcg_gen_op1i(INDEX_op_tm_cancel, TCG_TYPE_I64, arg);
+}
+
 void tcg_gen_discard_i64(TCGv_i64 arg)
 {
     if (TCG_TARGET_REG_BITS == 64) {

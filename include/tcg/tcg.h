@@ -792,6 +792,8 @@ void tcg_gen_call7(void *func, TCGHelperInfo *, TCGTemp *ret,
 TCGOp *tcg_emit_op(TCGOpcode opc, unsigned nargs);
 void tcg_op_remove(TCGContext *s, TCGOp *op);
 
+void tcg_gen_tm(TCGContext *s, uint64_t pc);
+
 /**
  * tcg_remove_ops_after:
  * @op: target operation

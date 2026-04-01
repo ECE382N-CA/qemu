@@ -2126,6 +2126,12 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc, TCGType ext,
     int c2 = const_args[2];
 
     switch (opc) {
+    case INDEX_op_tm_start:
+    case INDEX_op_tm_commit:
+    case INDEX_op_tm_cancel:
+        // TODO: codegen TME instructions
+        break;
+
     case INDEX_op_goto_ptr:
         tcg_out_insn(s, 3207, BR, a0);
         break;

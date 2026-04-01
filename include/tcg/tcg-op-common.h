@@ -289,6 +289,10 @@ void tcg_gen_sar_i64(TCGv_i64 ret, TCGv_i64 arg1, TCGv_i64 arg2);
 void tcg_gen_mul_i64(TCGv_i64 ret, TCGv_i64 arg1, TCGv_i64 arg2);
 void tcg_gen_neg_i64(TCGv_i64 ret, TCGv_i64 arg);
 
+/* ops for arm tme */
+void tcg_gen_tm_start_i64(TCGv_i64 arg);
+void tcg_gen_tm_commit_i64(void);
+void tcg_gen_tm_cancel_i64(int64_t arg);
 
 /* Size changing operations.  */
 

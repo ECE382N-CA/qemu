@@ -2137,6 +2137,10 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     }
 
     switch (op) {
+    case INDEX_op_tm_start:
+    case INDEX_op_tm_commit:
+    case INDEX_op_tm_cancel:
+        return true;
     case INDEX_op_discard:
     case INDEX_op_set_label:
     case INDEX_op_call:
@@ -3368,6 +3372,75 @@ static void remove_label_use(TCGOp *op, int idx)
         }
     }
     g_assert_not_reached();
+}
+
+static bool is_safe_inside_tm(TCGOp *op)
+{
+    switch (op->opc) {
+    case INDEX_op_mov_i64:
+    case INDEX_op_add_i64:
+    case INDEX_op_sub_i64:
+    case INDEX_op_ext32u_i64:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
+{
+    TCGOp *op, *next;
+    bool in_tm = false;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+
+        switch (op->opc) {
+        // =========================
+        // MEMORY OPS → START TM
+        // =========================
+        case INDEX_op_mb:
+            if (!in_tm) {
+                TCGv_i64 ret = tcg_temp_new_i64();
+                tcg_op_insert_before(s, op, INDEX_op_tm_start, 1)->args[0] =
+                    tcgv_i64_arg(ret);
+                in_tm = true;
+            }
+            // REMOVE the mb
+            tcg_op_remove(s, op);
+            break;
+        case INDEX_op_qemu_ld_i32:
+        case INDEX_op_qemu_st_i32:
+        case INDEX_op_qemu_st8_i32:
+        case INDEX_op_qemu_ld_i64:
+        case INDEX_op_qemu_st_i64:
+        case INDEX_op_qemu_ld_i128:
+        case INDEX_op_qemu_st_i128:
+            if (!in_tm) {
+                TCGv_i64 ret = tcg_temp_new_i64();
+                tcg_op_insert_before(s, op, INDEX_op_tm_start, 1)->args[0] =
+                    tcgv_i64_arg(ret);
+                in_tm = true;
+            }
+            break;
+
+        // =========================
+        // END TM
+        // =========================
+        default:
+            if (in_tm && !is_safe_inside_tm(op)) {
+                tcg_op_insert_before(s, op, INDEX_op_tm_commit, 0);
+                in_tm = false;
+            }
+            break;
+        }
+    }
+
+    // =========================
+    // END OF TB → CLOSE TM
+    // =========================
+    if (in_tm) {
+        tcg_gen_tm_commit_i64();
+    }
 }
 
 void tcg_op_remove(TCGContext *s, TCGOp *op)
@@ -6375,6 +6448,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             liveness_pass_1(s);
         }
     }
+
+    /* generate ops for transaction memory before dump ops  */
+    tcg_gen_tm(s, pc_start);
 
     if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)
                  && qemu_log_in_addr_range(pc_start))) {

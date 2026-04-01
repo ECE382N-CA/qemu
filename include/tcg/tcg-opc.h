@@ -263,6 +263,11 @@ DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
+/* ops for arm tme */
+DEF(tm_start, 1, 0, 0, 0)
+DEF(tm_commit, 0, 0, 0, 0)
+DEF(tm_cancel, 0, 0, 1, 0)
+
 #include "tcg-target-opc.h.inc"
 
 #undef DATA64_ARGS
