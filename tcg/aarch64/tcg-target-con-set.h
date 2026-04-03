@@ -9,6 +9,8 @@
  * Each operand should be a sequence of constraint letters as defined by
  * tcg-target-con-str.h; the constraint combination is inclusive or.
  */
+C_O0_I0()
+C_O1_I0(r)
 C_O0_I1(r)
 C_O0_I2(r, rC)
 C_O0_I2(rz, r)

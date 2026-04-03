@@ -647,6 +647,24 @@ typedef enum {
     BTI_C           = 0xd503245f,
     BTI_J           = 0xd503249f,
     BTI_JC          = 0xd50324df,
+
+    /* ARM TME (Transactional Memory Extension) instructions.
+     * TSTART <Xd>   writes the transaction start result (0 = success,
+     *               non-zero = abort cause) into Xd.  Encoding:
+     *               [31:20] = 0xd5233, [19:16] = 0x0, [15:5] = 0x030,
+     *               [4:0]   = Rd   →  0xD5233060 | Rd
+     *
+     * TCOMMIT       commits the current transaction.  No register operands;
+     *               XZR (register 31) is hardcoded in the base encoding:
+     *               0xD503307F
+     *
+     * TCANCEL #imm  aborts the current transaction with a 16-bit reason code.
+     *               Exception-class form: 0xD4600000 | (imm16 << 5)
+     */
+
+    TME_TSTART      = 0xd5233060,
+    TME_TCOMMIT     = 0xd503307f,
+    TME_TCANCEL     = 0xd4600000,
 } AArch64Insn;
 
 static inline uint32_t tcg_in32(TCGContext *s)
@@ -1664,6 +1682,27 @@ static inline void tcg_out_mb(TCGContext *s, TCGArg a0)
     tcg_out32(s, sync[a0 & TCG_MO_ALL]);
 }
 
+/*
+ * ARM TME (Transactional Memory Extension) emit helpers.
+ */
+static inline void tcg_out_tstart(TCGContext *s, TCGReg rd)
+{
+    /* TSTART <Xd>: 0xD5233060 | Rd */
+    tcg_out32(s, TME_TSTART | (rd & 0x1f));
+}
+
+static inline void tcg_out_tcommit(TCGContext *s)
+{
+    /* TCOMMIT: 0xD503307F */
+    tcg_out32(s, TME_TCOMMIT);
+}
+
+static inline void tcg_out_tcancel(TCGContext *s, uint16_t imm16)
+{
+    /* TCANCEL #imm16: 0xD4600000 | (imm16 << 5) */
+    tcg_out32(s, TME_TCANCEL | ((uint32_t)imm16 << 5));
+}
+
 static void tcg_out_cltz(TCGContext *s, TCGType ext, TCGReg d,
                          TCGReg a0, TCGArg b, bool const_b, bool is_ctz)
 {
@@ -2127,9 +2166,15 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc, TCGType ext,
 
     switch (opc) {
     case INDEX_op_tm_start:
+        tcg_out_tstart(s, a0);
+        break;
+
     case INDEX_op_tm_commit:
+        tcg_out_tcommit(s);
+        break;
+
     case INDEX_op_tm_cancel:
-        // TODO: codegen TME instructions
+        tcg_out_tcancel(s, (uint16_t)a0);
         break;
 
     case INDEX_op_goto_ptr:
@@ -2961,6 +3006,21 @@ static TCGConstraintSetIndex
 tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
 {
     switch (op) {
+    case INDEX_op_tm_start:
+        /*
+         * TSTART writes its return value (0 = success, else abort cause)
+         * into a single general-purpose register.  DEF says 1 oarg, 0 iargs.
+         */
+        return C_O1_I0(r);
+
+    case INDEX_op_tm_commit:
+    case INDEX_op_tm_cancel:
+        /*
+         * TCOMMIT has no register operands at all (DEF: 0 oargs, 0 iargs).
+         * TCANCEL has one const arg (the reason imm) but 0 register args.
+         */
+        return C_O0_I0();
+
     case INDEX_op_goto_ptr:
         return C_O0_I1(r);
 

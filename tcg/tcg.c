@@ -840,11 +840,13 @@ static int tcg_out_pool_finalize(TCGContext *s)
 
 /* Define an enumeration for the various combinations. */
 
+#define C_O0_I0()                       C_PFX1(c_o0_i0_, _),
 #define C_O0_I1(I1)                     C_PFX1(c_o0_i1_, I1),
 #define C_O0_I2(I1, I2)                 C_PFX2(c_o0_i2_, I1, I2),
 #define C_O0_I3(I1, I2, I3)             C_PFX3(c_o0_i3_, I1, I2, I3),
 #define C_O0_I4(I1, I2, I3, I4)         C_PFX4(c_o0_i4_, I1, I2, I3, I4),
 
+#define C_O1_I0(O1)                     C_PFX1(c_o1_i0_, O1),
 #define C_O1_I1(O1, I1)                 C_PFX2(c_o1_i1_, O1, I1),
 #define C_O1_I2(O1, I1, I2)             C_PFX3(c_o1_i2_, O1, I1, I2),
 #define C_O1_I3(O1, I1, I2, I3)         C_PFX4(c_o1_i3_, O1, I1, I2, I3),
@@ -867,10 +869,12 @@ typedef enum {
 
 static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode, TCGType, unsigned);
 
+#undef C_O0_I0
 #undef C_O0_I1
 #undef C_O0_I2
 #undef C_O0_I3
 #undef C_O0_I4
+#undef C_O1_I0
 #undef C_O1_I1
 #undef C_O1_I2
 #undef C_O1_I3
@@ -891,11 +895,13 @@ typedef struct TCGConstraintSet {
     const char *args_ct_str[TCG_MAX_OP_ARGS];
 } TCGConstraintSet;
 
+#define C_O0_I0()                       { 0, 0, { } },
 #define C_O0_I1(I1)                     { 0, 1, { #I1 } },
 #define C_O0_I2(I1, I2)                 { 0, 2, { #I1, #I2 } },
 #define C_O0_I3(I1, I2, I3)             { 0, 3, { #I1, #I2, #I3 } },
 #define C_O0_I4(I1, I2, I3, I4)         { 0, 4, { #I1, #I2, #I3, #I4 } },
 
+#define C_O1_I0(O1)                     { 1, 0, { #O1 } },
 #define C_O1_I1(O1, I1)                 { 1, 1, { #O1, #I1 } },
 #define C_O1_I2(O1, I1, I2)             { 1, 2, { #O1, #I1, #I2 } },
 #define C_O1_I3(O1, I1, I2, I3)         { 1, 3, { #O1, #I1, #I2, #I3 } },
@@ -915,10 +921,12 @@ static const TCGConstraintSet constraint_sets[] = {
 #include "tcg-target-con-set.h"
 };
 
+#undef C_O0_I0
 #undef C_O0_I1
 #undef C_O0_I2
 #undef C_O0_I3
 #undef C_O0_I4
+#undef C_O1_I0
 #undef C_O1_I1
 #undef C_O1_I2
 #undef C_O1_I3
@@ -934,11 +942,13 @@ static const TCGConstraintSet constraint_sets[] = {
 
 /* Expand the enumerator to be returned from tcg_target_op_def(). */
 
+#define C_O0_I0()                       C_PFX1(c_o0_i0_, _)
 #define C_O0_I1(I1)                     C_PFX1(c_o0_i1_, I1)
 #define C_O0_I2(I1, I2)                 C_PFX2(c_o0_i2_, I1, I2)
 #define C_O0_I3(I1, I2, I3)             C_PFX3(c_o0_i3_, I1, I2, I3)
 #define C_O0_I4(I1, I2, I3, I4)         C_PFX4(c_o0_i4_, I1, I2, I3, I4)
 
+#define C_O1_I0(O1)                     C_PFX1(c_o1_i0_, O1)
 #define C_O1_I1(O1, I1)                 C_PFX2(c_o1_i1_, O1, I1)
 #define C_O1_I2(O1, I1, I2)             C_PFX3(c_o1_i2_, O1, I1, I2)
 #define C_O1_I3(O1, I1, I2, I3)         C_PFX4(c_o1_i3_, O1, I1, I2, I3)
