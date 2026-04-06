@@ -3399,6 +3399,16 @@ static bool is_safe_inside_tm(TCGOp *op)
 
 void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
 {
+    /* Only enable TME optimization on ARM64 (AArch64) backend */
+#ifndef TCG_TARGET_AARCH64
+    return;  /* Skip TME for non-ARM targets */
+#else
+    /* Check if ARM host supports TME at runtime */
+    if (!tcg_aarch64_has_tme()) {
+        return;  /* TME not supported on this CPU */
+    }
+#endif
+
     TCGOp *op, *next;
     bool in_tm = false;
 

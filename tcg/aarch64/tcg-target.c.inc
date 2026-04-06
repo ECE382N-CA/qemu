@@ -11,6 +11,7 @@
  */
 
 #include "qemu/bitops.h"
+#include "qemu/osdep.h"
 
 /* Used for function call generation. */
 #define TCG_REG_CALL_STACK              TCG_REG_SP
@@ -1683,8 +1684,32 @@ static inline void tcg_out_mb(TCGContext *s, TCGArg a0)
 }
 
 /*
- * ARM TME (Transactional Memory Extension) emit helpers.
+ * ARM TME (Transactional Memory Extension) runtime detection and helpers.
  */
+
+/* Define HWCAP2_TME if not already defined in system headers */
+#ifndef HWCAP2_TME
+#define HWCAP2_TME (1 << 22)
+#endif
+
+__attribute__((unused))
+static bool tcg_aarch64_has_tme(void)
+{
+    /* Check if ARM host processor supports TME (Transactional Memory Extension) */
+#ifdef CONFIG_LINUX
+#ifdef CONFIG_GETAUXVAL
+    unsigned long hwcap2 = qemu_getauxval(AT_HWCAP2);
+    return (hwcap2 & HWCAP2_TME) != 0;
+#else
+    /* Fallback: assume no TME support if getauxval not available */
+    return false;
+#endif
+#else
+    /* For non-Linux systems, disable TME by default */
+    return false;
+#endif
+}
+
 static inline void tcg_out_tstart(TCGContext *s, TCGReg rd)
 {
     /* TSTART <Xd>: 0xD5233060 | Rd */

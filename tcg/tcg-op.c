@@ -1481,7 +1481,7 @@ void tcg_gen_tm_start_i64(TCGv_i64 arg)
 
 void tcg_gen_tm_commit_i64(void)
 {
-    tcg_gen_op1i(INDEX_op_tm_commit, 0, 0);
+    tcg_emit_op(INDEX_op_tm_commit, 0);
 }
 
 void tcg_gen_tm_cancel_i64(int64_t arg)
