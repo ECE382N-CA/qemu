@@ -38,6 +38,7 @@ bool qemu_log_separate(void);
 #define CPU_LOG_TB_VPU     (1 << 21)
 #define LOG_TB_OP_PLUGIN   (1 << 22)
 #define LOG_INVALID_MEM    (1 << 23)
+#define CPU_LOG_TME        (1 << 24)
 
 /* Lock/unlock output. */
 
@@ -97,3 +98,4 @@ int qemu_str_to_log_mask(const char *str);
 void qemu_print_log_usage(FILE *f);
 
 #endif
+

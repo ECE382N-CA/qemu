@@ -3384,82 +3384,664 @@ static void remove_label_use(TCGOp *op, int idx)
     g_assert_not_reached();
 }
 
-static bool is_safe_inside_tm(TCGOp *op)
+static void tcg_tm_add_label_use(TCGLabel *l, TCGOp *op)
 {
-    switch (op->opc) {
-    case INDEX_op_mov_i64:
-    case INDEX_op_add_i64:
-    case INDEX_op_sub_i64:
-    case INDEX_op_ext32u_i64:
+    TCGLabelUse *u = tcg_malloc(sizeof(TCGLabelUse));
+
+    u->op = op;
+    QSIMPLEQ_INSERT_TAIL(&l->branches, u, next);
+}
+
+typedef struct TCGTMConfig {
+    bool initialized;
+    bool debug;
+    bool force_cancel;
+    uint16_t cancel_imm;
+} TCGTMConfig;
+
+static TCGTMConfig tcg_tm_config;
+
+static const TCGTMConfig *tcg_tm_get_config(void)
+{
+    if (!tcg_tm_config.initialized) {
+        const char *debug_env = getenv("QEMU_TCG_TME_DEBUG");
+        const char *force_cancel_env = getenv("QEMU_TCG_TME_FORCE_CANCEL");
+        const char *cancel_imm_env = getenv("QEMU_TCG_TME_CANCEL_IMM");
+
+        tcg_tm_config.initialized = true;
+        tcg_tm_config.debug = debug_env && debug_env[0] &&
+                              strcmp(debug_env, "0") != 0;
+        tcg_tm_config.force_cancel = force_cancel_env && force_cancel_env[0] &&
+                                     strcmp(force_cancel_env, "0") != 0;
+        tcg_tm_config.cancel_imm = 1;
+
+        if (cancel_imm_env && cancel_imm_env[0]) {
+            unsigned long imm;
+
+            if (!qemu_strtoul(cancel_imm_env, NULL, 0, &imm) && imm <= UINT16_MAX) {
+                tcg_tm_config.cancel_imm = imm;
+            }
+        }
+    }
+    return &tcg_tm_config;
+}
+
+static void tcg_tm_log_event(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+
+static void tcg_tm_log_event(const char *fmt, ...)
+{
+    FILE *logfile;
+    va_list ap;
+
+    if (!qemu_loglevel_mask(CPU_LOG_TME)) {
+        return;
+    }
+
+    logfile = qemu_log_trylock();
+    if (!logfile) {
+        return;
+    }
+
+    va_start(ap, fmt);
+    vfprintf(logfile, fmt, ap);
+    va_end(ap);
+    qemu_log_unlock(logfile);
+}
+
+static bool tcg_tm_is_seq_barrier(TCGBar mb_type)
+{
+    return (mb_type & TCG_BAR_SC) == TCG_BAR_SC;
+}
+
+static bool tcg_tm_is_memory_body_op(TCGOpcode opc)
+{
+    switch (opc) {
+    case INDEX_op_qemu_ld_i32:
+    case INDEX_op_qemu_ld_i64:
+    case INDEX_op_qemu_st_i32:
+    case INDEX_op_qemu_st_i64:
+    case INDEX_op_qemu_st8_i32:
         return true;
     default:
         return false;
     }
 }
 
+static bool tcg_tm_is_store_body_op(TCGOpcode opc)
+{
+    switch (opc) {
+    case INDEX_op_qemu_st_i32:
+    case INDEX_op_qemu_st_i64:
+    case INDEX_op_qemu_st8_i32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool tcg_tm_temp_is_runtime_state(TCGTemp *ts)
+{
+    const char *name;
+
+    if (ts->kind != TEMP_FIXED && ts->kind != TEMP_GLOBAL) {
+        return false;
+    }
+
+    name = ts->name;
+    if (name == NULL) {
+        return false;
+    }
+
+    return strcmp(name, "rip") == 0 ||
+           strcmp(name, "rsp") == 0 ||
+           strcmp(name, "rbp") == 0 ||
+           strcmp(name, "fs_base") == 0 ||
+           strcmp(name, "cc_dst") == 0 ||
+           strcmp(name, "cc_src") == 0 ||
+           strcmp(name, "cc_src2") == 0 ||
+           strcmp(name, "cc_op") == 0 ||
+           strcmp(name, "env") == 0;
+}
+
+static TCGOp *tcg_tm_find_prev_def(TCGOp *before, TCGTemp *target)
+{
+    TCGOp *op = QTAILQ_PREV(before, link);
+
+    while (op != NULL) {
+        switch (op->opc) {
+        case INDEX_op_set_label:
+        case INDEX_op_insn_start:
+        case INDEX_op_br:
+        case INDEX_op_brcond_i32:
+        case INDEX_op_brcond_i64:
+        case INDEX_op_brcond2_i32:
+        case INDEX_op_call:
+        case INDEX_op_goto_tb:
+        case INDEX_op_goto_ptr:
+        case INDEX_op_exit_tb:
+        case INDEX_op_mb:
+            return NULL;
+        default:
+            break;
+        }
+
+    switch (op->opc) {
+    case INDEX_op_qemu_ld_i32:
+    case INDEX_op_qemu_ld_i64:
+    case INDEX_op_ld_i32:
+    case INDEX_op_ld_i64:
+    case INDEX_op_mov_i32:
+    case INDEX_op_mov_i64:
+    case INDEX_op_add_i64:
+        case INDEX_op_sub_i64:
+        case INDEX_op_and_i64:
+        case INDEX_op_or_i64:
+        case INDEX_op_xor_i64:
+        case INDEX_op_ext32u_i64:
+        case INDEX_op_ext32s_i64:
+        case INDEX_op_extu_i32_i64:
+            if (arg_temp(op->args[0]) == target) {
+                return op;
+            }
+            break;
+        default:
+            break;
+        }
+
+        op = QTAILQ_PREV(op, link);
+    }
+
+    return NULL;
+}
+
+static bool tcg_tm_temp_is_safe_value(TCGOp *use_op, TCGTemp *ts,
+                                      unsigned depth)
+{
+    TCGOp *def;
+
+    if (depth > 8) {
+        return false;
+    }
+    if (tcg_tm_temp_is_runtime_state(ts)) {
+        return false;
+    }
+
+    switch (ts->kind) {
+    case TEMP_CONST:
+        return true;
+    case TEMP_FIXED:
+    case TEMP_GLOBAL:
+        return true;
+    case TEMP_EBB:
+    case TEMP_TB:
+        break;
+    default:
+        return false;
+    }
+
+    def = tcg_tm_find_prev_def(use_op, ts);
+    if (def == NULL) {
+        return false;
+    }
+
+    switch (def->opc) {
+    case INDEX_op_mov_i32:
+    case INDEX_op_mov_i64:
+    case INDEX_op_ext32u_i64:
+    case INDEX_op_ext32s_i64:
+    case INDEX_op_extu_i32_i64:
+        return tcg_tm_temp_is_safe_value(def, arg_temp(def->args[1]),
+                                         depth + 1);
+    case INDEX_op_add_i64:
+    case INDEX_op_sub_i64:
+    case INDEX_op_and_i64:
+    case INDEX_op_or_i64:
+    case INDEX_op_xor_i64:
+        return tcg_tm_temp_is_safe_value(def, arg_temp(def->args[1]),
+                                         depth + 1) &&
+               tcg_tm_temp_is_safe_value(def, arg_temp(def->args[2]),
+                                         depth + 1);
+    case INDEX_op_qemu_ld_i32:
+    case INDEX_op_qemu_ld_i64:
+    case INDEX_op_ld_i32:
+    case INDEX_op_ld_i64:
+        /*
+         * Keep transactional store payloads away from memory-derived values
+         * for now. This avoids wrapping regions whose data depends on env
+         * loads or other memory reads outside the transactional slice.
+         */
+        return false;
+    default:
+        return false;
+    }
+}
+
+static bool tcg_tm_temp_is_safe_addr(TCGOp *use_op, TCGTemp *ts, unsigned depth)
+{
+    TCGOp *def;
+
+    if (depth > 8) {
+        return false;
+    }
+    if (tcg_tm_temp_is_runtime_state(ts)) {
+        return false;
+    }
+
+    switch (ts->kind) {
+    case TEMP_CONST:
+        return false;
+    case TEMP_FIXED:
+    case TEMP_GLOBAL:
+        return true;
+    case TEMP_EBB:
+    case TEMP_TB:
+        break;
+    default:
+        return false;
+    }
+
+    def = tcg_tm_find_prev_def(use_op, ts);
+    if (def == NULL) {
+        return false;
+    }
+
+    switch (def->opc) {
+    case INDEX_op_mov_i32:
+    case INDEX_op_mov_i64:
+    case INDEX_op_ext32u_i64:
+    case INDEX_op_ext32s_i64:
+    case INDEX_op_extu_i32_i64:
+        return tcg_tm_temp_is_safe_addr(def, arg_temp(def->args[1]), depth + 1);
+    case INDEX_op_add_i64:
+    case INDEX_op_sub_i64:
+        if (arg_temp(def->args[2])->kind == TEMP_CONST) {
+            return tcg_tm_temp_is_safe_addr(def, arg_temp(def->args[1]),
+                                            depth + 1);
+        }
+        if (arg_temp(def->args[1])->kind == TEMP_CONST) {
+            return tcg_tm_temp_is_safe_addr(def, arg_temp(def->args[2]),
+                                            depth + 1);
+        }
+        return tcg_tm_temp_is_safe_addr(def, arg_temp(def->args[1]), depth + 1) &&
+               tcg_tm_temp_is_safe_addr(def, arg_temp(def->args[2]), depth + 1);
+    default:
+        return false;
+    }
+}
+
+static bool tcg_tm_args_are_guest_only(TCGOp *op, unsigned nb_args)
+{
+    for (unsigned i = 0; i < nb_args; ++i) {
+        if (tcg_tm_temp_is_runtime_state(arg_temp(op->args[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tcg_tm_memory_body_addr_is_safe(TCGOp *op)
+{
+    TCGTemp *addr;
+
+    switch (op->opc) {
+    case INDEX_op_qemu_ld_i32:
+    case INDEX_op_qemu_ld_i64:
+        addr = arg_temp(op->args[1]);
+        break;
+    case INDEX_op_qemu_st_i32:
+    case INDEX_op_qemu_st_i64:
+    case INDEX_op_qemu_st8_i32:
+        addr = arg_temp(op->args[1]);
+        break;
+    default:
+        return true;
+    }
+
+    return tcg_tm_temp_is_safe_addr(op, addr, 0);
+}
+
+static bool tcg_tm_memory_body_memop_is_safe(TCGOp *op)
+{
+    MemOp mop;
+
+    switch (op->opc) {
+    case INDEX_op_qemu_ld_i32:
+    case INDEX_op_qemu_ld_i64:
+    case INDEX_op_qemu_st_i32:
+    case INDEX_op_qemu_st_i64:
+    case INDEX_op_qemu_st8_i32:
+        mop = get_memop(op->args[2]);
+        break;
+    default:
+        return true;
+    }
+
+    /*
+     * Keep transactional memory accesses to simple direct ops for now.
+     * Reject pair/complex atomic forms that are more likely to lower via
+     * helper/slow paths or carry stronger atomicity semantics than this
+     * fast path can safely preserve.
+     */
+    if ((mop & MO_ATOM_MASK) != MO_ATOM_IFALIGN) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool tcg_tm_is_body_op(TCGOp *op)
+{
+    switch (op->opc) {
+    case INDEX_op_qemu_ld_i32:
+    case INDEX_op_qemu_ld_i64:
+        return tcg_tm_args_are_guest_only(op, 2) &&
+               tcg_tm_memory_body_addr_is_safe(op) &&
+               tcg_tm_memory_body_memop_is_safe(op);
+    case INDEX_op_qemu_st_i32:
+    case INDEX_op_qemu_st_i64:
+    case INDEX_op_qemu_st8_i32:
+        return tcg_tm_args_are_guest_only(op, 2) &&
+               tcg_tm_temp_is_safe_value(op, arg_temp(op->args[0]), 0) &&
+               tcg_tm_memory_body_addr_is_safe(op) &&
+               tcg_tm_memory_body_memop_is_safe(op);
+    case INDEX_op_mov_i32:
+    case INDEX_op_mov_i64:
+        return tcg_tm_args_are_guest_only(op, 2);
+    case INDEX_op_add_i64:
+    case INDEX_op_sub_i64:
+    case INDEX_op_and_i64:
+    case INDEX_op_or_i64:
+    case INDEX_op_xor_i64:
+        return tcg_tm_args_are_guest_only(op, 3);
+    case INDEX_op_ext32u_i64:
+    case INDEX_op_ext32s_i64:
+    case INDEX_op_extu_i32_i64:
+        return tcg_tm_args_are_guest_only(op, 2);
+    default:
+        return false;
+    }
+}
+
+static bool tcg_tm_is_region_boundary(TCGOp *op)
+{
+    switch (op->opc) {
+    case INDEX_op_set_label:
+    case INDEX_op_insn_start:
+    case INDEX_op_br:
+    case INDEX_op_brcond_i32:
+    case INDEX_op_brcond_i64:
+    case INDEX_op_brcond2_i32:
+    case INDEX_op_call:
+    case INDEX_op_goto_tb:
+    case INDEX_op_goto_ptr:
+    case INDEX_op_exit_tb:
+    case INDEX_op_mb:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void tcg_tm_get_op_arg_layout(TCGOp *op, unsigned *nb_oargs,
+                                     unsigned *nb_iargs)
+{
+    if (op->opc == INDEX_op_call) {
+        *nb_oargs = TCGOP_CALLO(op);
+        if (nb_iargs != NULL) {
+            *nb_iargs = TCGOP_CALLI(op);
+        }
+    } else {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+        *nb_oargs = def->nb_oargs;
+        if (nb_iargs != NULL) {
+            *nb_iargs = def->nb_iargs;
+        }
+    }
+}
+
+static bool tcg_tm_temp_lives_out_after(TCGOp *region_end, TCGTemp *ts)
+{
+    TCGOp *op = QTAILQ_NEXT(region_end, link);
+
+    while (op != NULL) {
+        unsigned nb_oargs, nb_iargs;
+
+        if (tcg_tm_is_region_boundary(op)) {
+            return false;
+        }
+
+        tcg_tm_get_op_arg_layout(op, &nb_oargs, &nb_iargs);
+
+        for (unsigned i = 0; i < nb_oargs; ++i) {
+            if (arg_temp(op->args[i]) == ts) {
+                return false;
+            }
+        }
+
+        if (op->opc != INDEX_op_discard) {
+            for (unsigned i = 0; i < nb_iargs; ++i) {
+                if (arg_temp(op->args[nb_oargs + i]) == ts) {
+                    return true;
+                }
+            }
+        }
+
+        op = QTAILQ_NEXT(op, link);
+    }
+
+    return false;
+}
+
+static bool tcg_tm_region_is_self_contained(TCGOp *body_start, TCGOp *body_end)
+{
+    TCGOp *op = body_start;
+
+    while (op != NULL) {
+        unsigned nb_oargs;
+
+        tcg_tm_get_op_arg_layout(op, &nb_oargs, NULL);
+
+        for (unsigned i = 0; i < nb_oargs; ++i) {
+            TCGTemp *ts = arg_temp(op->args[i]);
+
+            if (!tcg_tm_temp_is_runtime_state(ts) &&
+                tcg_tm_temp_lives_out_after(body_end, ts)) {
+                return false;
+            }
+        }
+
+        if (op == body_end) {
+            break;
+        }
+        op = QTAILQ_NEXT(op, link);
+    }
+
+    return true;
+}
+
+static TCGOp *tcg_tm_clone_after(TCGContext *s, TCGOp *insert_after, TCGOp *src)
+{
+    TCGOp *clone = tcg_op_insert_after(s, insert_after, src->opc, src->nargs);
+
+    TCGOP_TYPE(clone) = TCGOP_TYPE(src);
+    memcpy(clone->args, src->args, sizeof(TCGArg) * src->nargs);
+    return clone;
+}
+
+static TCGOp *tcg_tm_find_body_end(TCGOp *mb_op, unsigned *count)
+{
+    TCGOp *body_end = mb_op;
+    TCGOp *op = QTAILQ_NEXT(mb_op, link);
+    unsigned n = 0;
+    bool seen_memory_op = false;
+    bool seen_store_op = false;
+
+    /*
+     * Keep the transactional region conservative: only cover a short run of
+     * straight-line guest memory-related ops that immediately follow the
+     * barrier.
+     */
+    while (op != NULL) {
+        if (tcg_tm_is_region_boundary(op) || !tcg_tm_is_body_op(op) || n >= 6) {
+            break;
+        }
+        seen_memory_op |= tcg_tm_is_memory_body_op(op->opc);
+        seen_store_op |= tcg_tm_is_store_body_op(op->opc);
+        body_end = op;
+        n++;
+        op = QTAILQ_NEXT(op, link);
+    }
+
+    if (!seen_memory_op || !seen_store_op || !tcg_tm_region_is_self_contained(QTAILQ_NEXT(mb_op, link), body_end)) {
+        *count = 0;
+        return mb_op;
+    }
+
+    *count = n;
+    return body_end;
+}
+
+static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
+                                               TCGOp *body_end,
+                                               unsigned body_count,
+                                               uint64_t pc_start)
+{
+    const TCGTMConfig *cfg = tcg_tm_get_config();
+    const unsigned cloned_body_count = body_count;
+    TCGLabel *fallback = gen_new_label();
+    TCGLabel *done = gen_new_label();
+    TCGv_i64 ret = tcg_temp_new_i64();
+    TCGOp *op, *cursor, *body_op;
+
+    /*
+     * TSTART returns zero on the successful transactional path.  Keep the
+     * original mb and body as the fallback path so fence semantics are
+     * preserved if the transaction cannot start.
+     */
+    op = tcg_op_insert_before(s, mb_op, INDEX_op_tm_start, 1);
+    TCGOP_TYPE(op) = TCG_TYPE_I64;
+    op->args[0] = tcgv_i64_arg(ret);
+    cursor = op;
+
+    op = tcg_op_insert_after(s, cursor, INDEX_op_brcond_i64, 4);
+    TCGOP_TYPE(op) = TCG_TYPE_I64;
+    op->args[0] = tcgv_i64_arg(ret);
+    op->args[1] = tcgv_i64_arg(tcg_constant_i64(0));
+    op->args[2] = TCG_COND_NE;
+    op->args[3] = label_arg(fallback);
+    tcg_tm_add_label_use(fallback, op);
+    cursor = op;
+
+    for (body_op = QTAILQ_NEXT(mb_op, link); body_count-- > 0;
+         body_op = QTAILQ_NEXT(body_op, link)) {
+        cursor = tcg_tm_clone_after(s, cursor, body_op);
+    }
+
+    /*
+     * Test support: force the transactional path to abort via TCANCEL,
+     * which should return control to the TSTART site and then take the
+     * fallback mb/body path.  This lets us validate fallback behavior without
+     * needing a real transactional conflict.
+     */
+    if (cfg->force_cancel) {
+        op = tcg_op_insert_after(s, cursor, INDEX_op_tm_cancel, 1);
+        TCGOP_TYPE(op) = TCG_TYPE_I64;
+        op->args[0] = cfg->cancel_imm;
+    } else {
+        op = tcg_op_insert_after(s, cursor, INDEX_op_tm_commit, 0);
+    }
+    cursor = op;
+
+    op = tcg_op_insert_after(s, cursor, INDEX_op_br, 1);
+    op->args[0] = label_arg(done);
+    tcg_tm_add_label_use(done, op);
+    cursor = op;
+
+    op = tcg_op_insert_after(s, cursor, INDEX_op_set_label, 1);
+    op->args[0] = label_arg(fallback);
+    fallback->present = 1;
+
+    op = tcg_op_insert_after(s, body_end, INDEX_op_set_label, 1);
+    op->args[0] = label_arg(done);
+    done->present = 1;
+
+    tcg_tm_log_event("TME: rewrite tb=%016" PRIx64
+                     " flags=0x%" TCG_PRIlx
+                     " body_ops=%u policy=%s fallback=mb+body\n",
+                     pc_start, mb_op->args[0], cloned_body_count,
+                     cfg->force_cancel ? "force-cancel" : "commit");
+
+    if (cfg->debug && qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)) {
+        qemu_log_mask(CPU_LOG_TB_OP_OPT,
+                      "TME: rewrite seq barrier at tb=%016" PRIx64
+                      " flags=0x%" TCG_PRIlx " body_ops=%u policy=%s"
+                      " fallback=mb+body\n",
+                      pc_start, mb_op->args[0], cloned_body_count,
+                      cfg->force_cancel ? "force-cancel" : "commit");
+    }
+}
+
 void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
 {
+    const TCGTMConfig *cfg = tcg_tm_get_config();
+
     /* Only enable TME optimization on ARM64 (AArch64) backend */
 #ifndef TCG_TARGET_AARCH64
     return;  /* Skip TME for non-ARM targets */
 #else
     /* Check if ARM host supports TME at runtime */
     if (!tcg_aarch64_has_tme()) {
+        tcg_tm_log_event("TME: skip tb=%016" PRIx64 " reason=no-host-tme\n",
+                         pc_start);
+        if (cfg->debug && qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)) {
+            qemu_log_mask(CPU_LOG_TB_OP_OPT,
+                          "TME: skip tb=%016" PRIx64 " (host has no TME)\n",
+                          pc_start);
+        }
         return;  /* TME not supported on this CPU */
     }
 #endif
 
     TCGOp *op, *next;
-    bool in_tm = false;
 
     QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        unsigned body_count;
+        TCGOp *body_end;
 
         switch (op->opc) {
         // =========================
-        // MEMORY OPS → START TM
+        // MEMORY BARRIER OPS → START TM
         // =========================
         case INDEX_op_mb:
-            if (!in_tm) {
-                TCGv_i64 ret = tcg_temp_new_i64();
-                tcg_op_insert_before(s, op, INDEX_op_tm_start, 1)->args[0] =
-                    tcgv_i64_arg(ret);
-                in_tm = true;
+            if (tcg_tm_is_seq_barrier(op->args[0])) {
+                body_end = tcg_tm_find_body_end(op, &body_count);
+                if (body_count != 0) {
+                    tcg_tm_insert_seq_barrier_fastpath(s, op, body_end,
+                                                       body_count, pc_start);
+                } else {
+                    tcg_tm_log_event("TME: leave tb=%016" PRIx64
+                                     " flags=0x%" TCG_PRIlx
+                                     " reason=no-eligible-body\n",
+                                     pc_start, op->args[0]);
+                    if (cfg->debug && qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)) {
+                        qemu_log_mask(CPU_LOG_TB_OP_OPT,
+                                      "TME: leave seq barrier without body"
+                                      " at tb=%016" PRIx64
+                                      " flags=0x%" TCG_PRIlx "\n",
+                                      pc_start, op->args[0]);
+                    }
+                }
+            } else if (cfg->debug && qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)) {
+                qemu_log_mask(CPU_LOG_TB_OP_OPT,
+                              "TME: leave non-seq mb at tb=%016" PRIx64
+                              " flags=0x%" TCG_PRIlx "\n",
+                              pc_start, op->args[0]);
             }
-            // REMOVE the mb
-            tcg_op_remove(s, op);
             break;
-        case INDEX_op_qemu_ld_i32:
-        case INDEX_op_qemu_st_i32:
-        case INDEX_op_qemu_st8_i32:
-        case INDEX_op_qemu_ld_i64:
-        case INDEX_op_qemu_st_i64:
-        case INDEX_op_qemu_ld_i128:
-        case INDEX_op_qemu_st_i128:
-            if (!in_tm) {
-                TCGv_i64 ret = tcg_temp_new_i64();
-                tcg_op_insert_before(s, op, INDEX_op_tm_start, 1)->args[0] =
-                    tcgv_i64_arg(ret);
-                in_tm = true;
-            }
-            break;
-
-        // =========================
-        // END TM
-        // =========================
         default:
-            if (in_tm && !is_safe_inside_tm(op)) {
-                tcg_op_insert_before(s, op, INDEX_op_tm_commit, 0);
-                in_tm = false;
-            }
             break;
         }
-    }
-
-    // =========================
-    // END OF TB → CLOSE TM
-    // =========================
-    if (in_tm) {
-        tcg_gen_tm_commit_i64();
     }
 }
 
@@ -6882,3 +7464,4 @@ void tcg_expand_vec_op(TCGOpcode o, TCGType t, unsigned e, TCGArg a0, ...)
     g_assert_not_reached();
 }
 #endif
+

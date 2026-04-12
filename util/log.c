@@ -505,6 +505,8 @@ const QEMULogItem qemu_log_items[] = {
       "include VPU registers in the 'cpu' logging" },
     { LOG_INVALID_MEM, "invalid_mem",
       "log invalid memory accesses" },
+    { CPU_LOG_TME, "tme",
+      "log TME rewrite decisions and transactional fast/fallback paths" },
     { 0, NULL, NULL },
 };
 
@@ -558,3 +560,4 @@ void qemu_print_log_usage(FILE *f)
     fprintf(f, "\nUse \"-d trace:help\" to get a list of trace events.\n\n");
 #endif
 }
+
