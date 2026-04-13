@@ -3448,6 +3448,26 @@ static void tcg_tm_log_event(const char *fmt, ...)
     qemu_log_unlock(logfile);
 }
 
+static void tcg_tm_log_ops(TCGContext *s, uint64_t pc_start,
+                           const char *phase)
+{
+    FILE *logfile;
+
+    if (!qemu_loglevel_mask(CPU_LOG_TME)) {
+        return;
+    }
+
+    logfile = qemu_log_trylock();
+    if (!logfile) {
+        return;
+    }
+
+    fprintf(logfile, "TME: %s tb=%016" PRIx64 "\n", phase, pc_start);
+    tcg_dump_ops(s, logfile, false);
+    fputc('\n', logfile);
+    qemu_log_unlock(logfile);
+}
+
 static bool tcg_tm_is_seq_barrier(TCGBar mb_type)
 {
     return (mb_type & TCG_BAR_SC) == TCG_BAR_SC;
@@ -3985,6 +4005,7 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
 void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
 {
     const TCGTMConfig *cfg = tcg_tm_get_config();
+    bool dumped_pre_rewrite = false;
 
     /* Only enable TME optimization on ARM64 (AArch64) backend */
 #ifndef TCG_TARGET_AARCH64
@@ -4017,8 +4038,13 @@ void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
             if (tcg_tm_is_seq_barrier(op->args[0])) {
                 body_end = tcg_tm_find_body_end(op, &body_count);
                 if (body_count != 0) {
+                    if (!dumped_pre_rewrite) {
+                        tcg_tm_log_ops(s, pc_start, "pre-rewrite ops");
+                        dumped_pre_rewrite = true;
+                    }
                     tcg_tm_insert_seq_barrier_fastpath(s, op, body_end,
                                                        body_count, pc_start);
+                    tcg_tm_log_ops(s, pc_start, "post-rewrite ops");
                 } else {
                     tcg_tm_log_event("TME: leave tb=%016" PRIx64
                                      " flags=0x%" TCG_PRIlx
