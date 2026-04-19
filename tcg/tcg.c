@@ -3539,8 +3539,13 @@ static TCGOp *tcg_tm_find_prev_def(TCGOp *before, TCGTemp *target)
         case INDEX_op_goto_tb:
         case INDEX_op_goto_ptr:
         case INDEX_op_exit_tb:
-        case INDEX_op_mb:
             return NULL;
+        case INDEX_op_mb:
+            /*
+             * mb is no longer a hard boundary for definition tracking as
+             * we now expand transactions to cover ops on both sides of it.
+             */
+            break;
         default:
             break;
         }
@@ -3626,11 +3631,11 @@ static bool tcg_tm_temp_is_safe_value(TCGOp *use_op, TCGTemp *ts,
     case INDEX_op_ld_i32:
     case INDEX_op_ld_i64:
         /*
-         * Keep transactional store payloads away from memory-derived values
-         * for now. This avoids wrapping regions whose data depends on env
-         * loads or other memory reads outside the transactional slice.
+         * Allow transactional store payloads to derive from memory loads.
+         * Now that the load is often inside the transactional slice,
+         * hardware TME handles these dependencies correctly.
          */
-        return false;
+        return true;
     default:
         return false;
     }
@@ -3648,6 +3653,7 @@ static bool tcg_tm_temp_is_safe_addr(TCGOp *use_op, TCGTemp *ts, unsigned depth)
     }
 
     switch (ts->kind) {
+    // hardcoded constant address is not safe, e.g., 0x8000
     case TEMP_CONST:
         return false;
     case TEMP_FIXED:
@@ -3684,6 +3690,10 @@ static bool tcg_tm_temp_is_safe_addr(TCGOp *use_op, TCGTemp *ts, unsigned depth)
         }
         return tcg_tm_temp_is_safe_addr(def, arg_temp(def->args[1]), depth + 1) &&
                tcg_tm_temp_is_safe_addr(def, arg_temp(def->args[2]), depth + 1);
+    case INDEX_op_qemu_ld_i32:
+    case INDEX_op_qemu_ld_i64:
+        /* Allow pointer-chasing within the transaction. */
+        return tcg_tm_temp_is_safe_addr(def, arg_temp(def->args[1]), depth + 1);
     default:
         return false;
     }
@@ -3777,6 +3787,8 @@ static bool tcg_tm_is_body_op(TCGOp *op)
     case INDEX_op_ext32s_i64:
     case INDEX_op_extu_i32_i64:
         return tcg_tm_args_are_guest_only(op, 2);
+    case INDEX_op_insn_start:
+        return true;
     default:
         return false;
     }
@@ -3889,46 +3901,81 @@ static TCGOp *tcg_tm_clone_after(TCGContext *s, TCGOp *insert_after, TCGOp *src)
     return clone;
 }
 
-static TCGOp *tcg_tm_find_body_end(TCGOp *mb_op, unsigned *count)
+static bool tcg_tm_analyze_region(TCGOp *mb_op, TCGOp **out_start, TCGOp **out_end,
+                                  unsigned *out_pre_count, unsigned *out_post_count)
 {
-    TCGOp *body_end = mb_op;
-    TCGOp *op = QTAILQ_NEXT(mb_op, link);
-    unsigned n = 0;
+    unsigned pre_count = 0, post_count = 0;
     bool seen_memory_op = false;
     bool seen_store_op = false;
+    TCGOp *start, *end, *op;
 
     /*
+     * Scan backwards from the barrier to include preceding operations.
      * Keep the transactional region conservative: only cover a short run of
-     * straight-line guest memory-related ops that immediately follow the
-     * barrier.
+     * straight-line guest memory-related ops.
      */
-    while (op != NULL) {
-        if (tcg_tm_is_region_boundary(op) || !tcg_tm_is_body_op(op) || n >= 6) {
+    start = mb_op;
+    op = QTAILQ_PREV(mb_op, link);
+    while (op != NULL && pre_count < 6) {
+        if (tcg_tm_is_region_boundary(op) || !tcg_tm_is_body_op(op)) {
             break;
         }
         seen_memory_op |= tcg_tm_is_memory_body_op(op->opc);
         seen_store_op |= tcg_tm_is_store_body_op(op->opc);
-        body_end = op;
-        n++;
+        start = op;
+        pre_count++;
+        op = QTAILQ_PREV(op, link);
+    }
+
+    /*
+     * Scan forwards from the barrier to include subsequent operations.
+     */
+    end = mb_op;
+    op = QTAILQ_NEXT(mb_op, link);
+    while (op != NULL && post_count < 6) {
+        if (tcg_tm_is_region_boundary(op) || !tcg_tm_is_body_op(op)) {
+            break;
+        }
+        seen_memory_op |= tcg_tm_is_memory_body_op(op->opc);
+        seen_store_op |= tcg_tm_is_store_body_op(op->opc);
+        end = op;
+        post_count++;
         op = QTAILQ_NEXT(op, link);
     }
 
-    if (!seen_memory_op || !seen_store_op || !tcg_tm_region_is_self_contained(QTAILQ_NEXT(mb_op, link), body_end)) {
-        *count = 0;
-        return mb_op;
+    /*
+     * Only proceed if we found at least one memory op and one store,
+     * and the region is not empty (excluding the barrier itself).
+     */
+    if (!seen_memory_op || !seen_store_op || (pre_count + post_count) == 0) {
+        return false;
     }
 
-    *count = n;
-    return body_end;
+    /*
+     * Verify that no values produced within the transaction are used
+     * before being committed.
+     */
+    if (!tcg_tm_region_is_self_contained(start, end)) {
+        return false;
+    }
+
+    *out_start = start;
+    *out_end = end;
+    *out_pre_count = pre_count;
+    *out_post_count = post_count;
+    return true;
 }
 
-static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
+static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s,
+                                               TCGOp *body_start,
+                                               TCGOp *mb_op,
                                                TCGOp *body_end,
-                                               unsigned body_count,
+                                               unsigned pre_count,
+                                               unsigned post_count,
                                                uint64_t pc_start)
 {
     const TCGTMConfig *cfg = tcg_tm_get_config();
-    const unsigned cloned_body_count = body_count;
+    const unsigned cloned_body_count = pre_count + post_count;
     TCGLabel *fallback = gen_new_label();
     TCGLabel *done = gen_new_label();
     TCGv_i64 ret = tcg_temp_new_i64();
@@ -3939,7 +3986,7 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
      * original mb and body as the fallback path so fence semantics are
      * preserved if the transaction cannot start.
      */
-    op = tcg_op_insert_before(s, mb_op, INDEX_op_tm_start, 1);
+    op = tcg_op_insert_before(s, body_start, INDEX_op_tm_start, 1);
     TCGOP_TYPE(op) = TCG_TYPE_I64;
     op->args[0] = tcgv_i64_arg(ret);
     cursor = op;
@@ -3953,7 +4000,15 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
     tcg_tm_add_label_use(fallback, op);
     cursor = op;
 
-    for (body_op = QTAILQ_NEXT(mb_op, link); body_count-- > 0;
+    /* Clone pre-barrier ops */
+    for (body_op = body_start; body_op != mb_op;
+         body_op = QTAILQ_NEXT(body_op, link)) {
+        cursor = tcg_tm_clone_after(s, cursor, body_op);
+    }
+
+    /* Clone post-barrier ops (skipping mb itself) */
+    for (body_op = QTAILQ_NEXT(mb_op, link);
+         body_op != QTAILQ_NEXT(body_end, link);
          body_op = QTAILQ_NEXT(body_op, link)) {
         cursor = tcg_tm_clone_after(s, cursor, body_op);
     }
@@ -3988,16 +4043,18 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
 
     tcg_tm_log_event("TME: rewrite tb=%016" PRIx64
                      " flags=0x%" TCG_PRIlx
-                     " body_ops=%u policy=%s fallback=mb+body\n",
+                     " body_ops=%u (pre=%u post=%u) policy=%s fallback=pre+mb+post\n",
                      pc_start, mb_op->args[0], cloned_body_count,
+                     pre_count, post_count,
                      cfg->force_cancel ? "force-cancel" : "commit");
 
     if (cfg->debug && qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)) {
         qemu_log_mask(CPU_LOG_TB_OP_OPT,
                       "TME: rewrite seq barrier at tb=%016" PRIx64
-                      " flags=0x%" TCG_PRIlx " body_ops=%u policy=%s"
-                      " fallback=mb+body\n",
+                      " flags=0x%" TCG_PRIlx " body_ops=%u (pre=%u post=%u)"
+                      " policy=%s fallback=pre+mb+post\n",
                       pc_start, mb_op->args[0], cloned_body_count,
+                      pre_count, post_count,
                       cfg->force_cancel ? "force-cancel" : "commit");
     }
 }
@@ -4008,7 +4065,7 @@ void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
     bool dumped_pre_rewrite = false;
 
     /* Only enable TME optimization on ARM64 (AArch64) backend */
-#ifndef TCG_TARGET_AARCH64
+#ifndef __aarch64__
     return;  /* Skip TME for non-ARM targets */
 #else
     /* Check if ARM host supports TME at runtime */
@@ -4027,23 +4084,24 @@ void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
     TCGOp *op, *next;
 
     QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
-        unsigned body_count;
-        TCGOp *body_end;
-
         switch (op->opc) {
         // =========================
         // MEMORY BARRIER OPS → START TM
         // =========================
         case INDEX_op_mb:
             if (tcg_tm_is_seq_barrier(op->args[0])) {
-                body_end = tcg_tm_find_body_end(op, &body_count);
-                if (body_count != 0) {
+                TCGOp *body_start, *body_end;
+                unsigned pre_count, post_count;
+
+                if (tcg_tm_analyze_region(op, &body_start, &body_end,
+                                          &pre_count, &post_count)) {
                     if (!dumped_pre_rewrite) {
                         tcg_tm_log_ops(s, pc_start, "pre-rewrite ops");
                         dumped_pre_rewrite = true;
                     }
-                    tcg_tm_insert_seq_barrier_fastpath(s, op, body_end,
-                                                       body_count, pc_start);
+                    tcg_tm_insert_seq_barrier_fastpath(s, body_start, op, body_end,
+                                                       pre_count, post_count,
+                                                       pc_start);
                     tcg_tm_log_ops(s, pc_start, "post-rewrite ops");
                 } else {
                     tcg_tm_log_event("TME: leave tb=%016" PRIx64
