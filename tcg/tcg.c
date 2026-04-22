@@ -3787,7 +3787,6 @@ static bool tcg_tm_is_region_boundary(TCGOp *op)
 {
     switch (op->opc) {
     case INDEX_op_set_label:
-    // case INDEX_op_insn_start:
     case INDEX_op_br:
     case INDEX_op_brcond_i32:
     case INDEX_op_brcond_i64:
@@ -3939,7 +3938,25 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
      * TSTART returns zero on the successful transactional path.  Keep the
      * original mb and body as the fallback path so fence semantics are
      * preserved if the transaction cannot start.
+     *
+     * Promote any TEMP_EBB in the body to TEMP_TB so they can safely cross
+     * the labels we are about to insert.
      */
+    for (body_op = QTAILQ_NEXT(mb_op, link); ; body_op = QTAILQ_NEXT(body_op, link)) {
+        const TCGOpDef *def = &tcg_op_defs[body_op->opc];
+        int n = def->nb_iargs + def->nb_oargs;
+
+        for (int i = 0; i < n; i++) {
+            TCGTemp *ts = arg_temp(body_op->args[i]);
+            if (ts->kind == TEMP_EBB) {
+                ts->kind = TEMP_TB;
+            }
+        }
+        if (body_op == body_end) {
+            break;
+        }
+    }
+
     op = tcg_op_insert_before(s, mb_op, INDEX_op_tm_start, 1);
     TCGOP_TYPE(op) = TCG_TYPE_I64;
     op->args[0] = tcgv_i64_arg(ret);
