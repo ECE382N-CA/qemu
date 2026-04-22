@@ -3514,7 +3514,6 @@ static bool tcg_tm_temp_is_runtime_state(TCGTemp *ts)
 
     return strcmp(name, "rip") == 0 ||
            strcmp(name, "rsp") == 0 ||
-           strcmp(name, "rbp") == 0 ||
            strcmp(name, "fs_base") == 0 ||
            strcmp(name, "cc_dst") == 0 ||
            strcmp(name, "cc_src") == 0 ||
@@ -3777,6 +3776,8 @@ static bool tcg_tm_is_body_op(TCGOp *op)
     case INDEX_op_ext32s_i64:
     case INDEX_op_extu_i32_i64:
         return tcg_tm_args_are_guest_only(op, 2);
+    case INDEX_op_insn_start:
+        return true;
     default:
         return false;
     }
@@ -3786,7 +3787,6 @@ static bool tcg_tm_is_region_boundary(TCGOp *op)
 {
     switch (op->opc) {
     case INDEX_op_set_label:
-    case INDEX_op_insn_start:
     case INDEX_op_br:
     case INDEX_op_brcond_i32:
     case INDEX_op_brcond_i64:
@@ -3938,7 +3938,25 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
      * TSTART returns zero on the successful transactional path.  Keep the
      * original mb and body as the fallback path so fence semantics are
      * preserved if the transaction cannot start.
+     *
+     * Promote any TEMP_EBB in the body to TEMP_TB so they can safely cross
+     * the labels we are about to insert.
      */
+    for (body_op = QTAILQ_NEXT(mb_op, link); ; body_op = QTAILQ_NEXT(body_op, link)) {
+        const TCGOpDef *def = &tcg_op_defs[body_op->opc];
+        int n = def->nb_iargs + def->nb_oargs;
+
+        for (int i = 0; i < n; i++) {
+            TCGTemp *ts = arg_temp(body_op->args[i]);
+            if (ts->kind == TEMP_EBB) {
+                ts->kind = TEMP_TB;
+            }
+        }
+        if (body_op == body_end) {
+            break;
+        }
+    }
+
     op = tcg_op_insert_before(s, mb_op, INDEX_op_tm_start, 1);
     TCGOP_TYPE(op) = TCG_TYPE_I64;
     op->args[0] = tcgv_i64_arg(ret);
@@ -3955,6 +3973,9 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
 
     for (body_op = QTAILQ_NEXT(mb_op, link); body_count-- > 0;
          body_op = QTAILQ_NEXT(body_op, link)) {
+        if (body_op->opc == INDEX_op_insn_start) {
+            continue;
+        }
         cursor = tcg_tm_clone_after(s, cursor, body_op);
     }
 
@@ -4008,7 +4029,7 @@ void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
     bool dumped_pre_rewrite = false;
 
     /* Only enable TME optimization on ARM64 (AArch64) backend */
-#ifndef TCG_TARGET_AARCH64
+#ifndef __aarch64__
     return;  /* Skip TME for non-ARM targets */
 #else
     /* Check if ARM host supports TME at runtime */
@@ -7054,6 +7075,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 
     tcg_optimize(s);
 
+    /* generate ops for transaction memory before dump ops  */
+    tcg_gen_tm(s, pc_start);
+
     reachable_code_pass(s);
     liveness_pass_0(s);
     liveness_pass_1(s);
@@ -7076,9 +7100,6 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             liveness_pass_1(s);
         }
     }
-
-    /* generate ops for transaction memory before dump ops  */
-    tcg_gen_tm(s, pc_start);
 
     if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)
                  && qemu_log_in_addr_range(pc_start))) {
