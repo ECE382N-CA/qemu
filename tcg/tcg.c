@@ -3513,7 +3513,6 @@ static bool tcg_tm_temp_is_runtime_state(TCGTemp *ts)
     }
 
     return strcmp(name, "rip") == 0 ||
-           strcmp(name, "rsp") == 0 ||
            strcmp(name, "fs_base") == 0 ||
            strcmp(name, "cc_dst") == 0 ||
            strcmp(name, "cc_src") == 0 ||
@@ -3545,13 +3544,13 @@ static TCGOp *tcg_tm_find_prev_def(TCGOp *before, TCGTemp *target)
         }
 
     switch (op->opc) {
-    case INDEX_op_qemu_ld_i32:
-    case INDEX_op_qemu_ld_i64:
-    case INDEX_op_ld_i32:
-    case INDEX_op_ld_i64:
-    case INDEX_op_mov_i32:
-    case INDEX_op_mov_i64:
-    case INDEX_op_add_i64:
+        case INDEX_op_qemu_ld_i32:
+        case INDEX_op_qemu_ld_i64:
+        case INDEX_op_ld_i32:
+        case INDEX_op_ld_i64:
+        case INDEX_op_mov_i32:
+        case INDEX_op_mov_i64:
+        case INDEX_op_add_i64:
         case INDEX_op_sub_i64:
         case INDEX_op_and_i64:
         case INDEX_op_or_i64:
@@ -3776,6 +3775,7 @@ static bool tcg_tm_is_body_op(TCGOp *op)
     case INDEX_op_ext32s_i64:
     case INDEX_op_extu_i32_i64:
         return tcg_tm_args_are_guest_only(op, 2);
+    case INDEX_op_mb:
     case INDEX_op_insn_start:
         return true;
     default:
@@ -3795,7 +3795,6 @@ static bool tcg_tm_is_region_boundary(TCGOp *op)
     case INDEX_op_goto_tb:
     case INDEX_op_goto_ptr:
     case INDEX_op_exit_tb:
-    case INDEX_op_mb:
         return true;
     default:
         return false;
