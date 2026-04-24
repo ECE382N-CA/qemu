@@ -3514,10 +3514,6 @@ static bool tcg_tm_temp_is_runtime_state(TCGTemp *ts)
 
     return strcmp(name, "rip") == 0 ||
            strcmp(name, "fs_base") == 0 ||
-           strcmp(name, "cc_dst") == 0 ||
-           strcmp(name, "cc_src") == 0 ||
-           strcmp(name, "cc_src2") == 0 ||
-           strcmp(name, "cc_op") == 0 ||
            strcmp(name, "env") == 0;
 }
 
@@ -3570,68 +3566,6 @@ static TCGOp *tcg_tm_find_prev_def(TCGOp *before, TCGTemp *target)
     }
 
     return NULL;
-}
-
-static bool tcg_tm_temp_is_safe_value(TCGOp *use_op, TCGTemp *ts,
-                                      unsigned depth)
-{
-    TCGOp *def;
-
-    if (depth > 8) {
-        return false;
-    }
-    if (tcg_tm_temp_is_runtime_state(ts)) {
-        return false;
-    }
-
-    switch (ts->kind) {
-    case TEMP_CONST:
-        return true;
-    case TEMP_FIXED:
-    case TEMP_GLOBAL:
-        return true;
-    case TEMP_EBB:
-    case TEMP_TB:
-        break;
-    default:
-        return false;
-    }
-
-    def = tcg_tm_find_prev_def(use_op, ts);
-    if (def == NULL) {
-        return false;
-    }
-
-    switch (def->opc) {
-    case INDEX_op_mov_i32:
-    case INDEX_op_mov_i64:
-    case INDEX_op_ext32u_i64:
-    case INDEX_op_ext32s_i64:
-    case INDEX_op_extu_i32_i64:
-        return tcg_tm_temp_is_safe_value(def, arg_temp(def->args[1]),
-                                         depth + 1);
-    case INDEX_op_add_i64:
-    case INDEX_op_sub_i64:
-    case INDEX_op_and_i64:
-    case INDEX_op_or_i64:
-    case INDEX_op_xor_i64:
-        return tcg_tm_temp_is_safe_value(def, arg_temp(def->args[1]),
-                                         depth + 1) &&
-               tcg_tm_temp_is_safe_value(def, arg_temp(def->args[2]),
-                                         depth + 1);
-    case INDEX_op_qemu_ld_i32:
-    case INDEX_op_qemu_ld_i64:
-    case INDEX_op_ld_i32:
-    case INDEX_op_ld_i64:
-        /*
-         * Keep transactional store payloads away from memory-derived values
-         * for now. This avoids wrapping regions whose data depends on env
-         * loads or other memory reads outside the transactional slice.
-         */
-        return false;
-    default:
-        return false;
-    }
 }
 
 static bool tcg_tm_temp_is_safe_addr(TCGOp *use_op, TCGTemp *ts, unsigned depth)
@@ -3759,7 +3693,6 @@ static bool tcg_tm_is_body_op(TCGOp *op)
     case INDEX_op_qemu_st_i64:
     case INDEX_op_qemu_st8_i32:
         return tcg_tm_args_are_guest_only(op, 2) &&
-               tcg_tm_temp_is_safe_value(op, arg_temp(op->args[0]), 0) &&
                tcg_tm_memory_body_addr_is_safe(op) &&
                tcg_tm_memory_body_memop_is_safe(op);
     case INDEX_op_mov_i32:
@@ -3801,83 +3734,6 @@ static bool tcg_tm_is_region_boundary(TCGOp *op)
     }
 }
 
-static void tcg_tm_get_op_arg_layout(TCGOp *op, unsigned *nb_oargs,
-                                     unsigned *nb_iargs)
-{
-    if (op->opc == INDEX_op_call) {
-        *nb_oargs = TCGOP_CALLO(op);
-        if (nb_iargs != NULL) {
-            *nb_iargs = TCGOP_CALLI(op);
-        }
-    } else {
-        const TCGOpDef *def = &tcg_op_defs[op->opc];
-
-        *nb_oargs = def->nb_oargs;
-        if (nb_iargs != NULL) {
-            *nb_iargs = def->nb_iargs;
-        }
-    }
-}
-
-static bool tcg_tm_temp_lives_out_after(TCGOp *region_end, TCGTemp *ts)
-{
-    TCGOp *op = QTAILQ_NEXT(region_end, link);
-
-    while (op != NULL) {
-        unsigned nb_oargs, nb_iargs;
-
-        if (tcg_tm_is_region_boundary(op)) {
-            return false;
-        }
-
-        tcg_tm_get_op_arg_layout(op, &nb_oargs, &nb_iargs);
-
-        for (unsigned i = 0; i < nb_oargs; ++i) {
-            if (arg_temp(op->args[i]) == ts) {
-                return false;
-            }
-        }
-
-        if (op->opc != INDEX_op_discard) {
-            for (unsigned i = 0; i < nb_iargs; ++i) {
-                if (arg_temp(op->args[nb_oargs + i]) == ts) {
-                    return true;
-                }
-            }
-        }
-
-        op = QTAILQ_NEXT(op, link);
-    }
-
-    return false;
-}
-
-static bool tcg_tm_region_is_self_contained(TCGOp *body_start, TCGOp *body_end)
-{
-    TCGOp *op = body_start;
-
-    while (op != NULL) {
-        unsigned nb_oargs;
-
-        tcg_tm_get_op_arg_layout(op, &nb_oargs, NULL);
-
-        for (unsigned i = 0; i < nb_oargs; ++i) {
-            TCGTemp *ts = arg_temp(op->args[i]);
-
-            if (!tcg_tm_temp_is_runtime_state(ts) &&
-                tcg_tm_temp_lives_out_after(body_end, ts)) {
-                return false;
-            }
-        }
-
-        if (op == body_end) {
-            break;
-        }
-        op = QTAILQ_NEXT(op, link);
-    }
-
-    return true;
-}
 
 static TCGOp *tcg_tm_clone_after(TCGContext *s, TCGOp *insert_after, TCGOp *src)
 {
@@ -3897,12 +3753,11 @@ static TCGOp *tcg_tm_find_body_end(TCGOp *mb_op, unsigned *count)
     bool seen_store_op = false;
 
     /*
-     * Keep the transactional region conservative: only cover a short run of
-     * straight-line guest memory-related ops that immediately follow the
-     * barrier.
+     * Capture a run of straight-line guest memory-related ops that
+     * immediately follow the barrier.
      */
     while (op != NULL) {
-        if (tcg_tm_is_region_boundary(op) || !tcg_tm_is_body_op(op) || n >= 6) {
+        if (tcg_tm_is_region_boundary(op) || !tcg_tm_is_body_op(op)) {
             break;
         }
         seen_memory_op |= tcg_tm_is_memory_body_op(op->opc);
@@ -3912,7 +3767,7 @@ static TCGOp *tcg_tm_find_body_end(TCGOp *mb_op, unsigned *count)
         op = QTAILQ_NEXT(op, link);
     }
 
-    if (!seen_memory_op || !seen_store_op || !tcg_tm_region_is_self_contained(QTAILQ_NEXT(mb_op, link), body_end)) {
+    if (!seen_memory_op || !seen_store_op) {
         *count = 0;
         return mb_op;
     }
