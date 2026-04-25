@@ -3570,6 +3570,7 @@ static TCGOp *tcg_tm_find_prev_def(TCGOp *before, TCGTemp *target)
 
 static bool tcg_tm_temp_is_safe_addr(TCGOp *use_op, TCGTemp *ts, unsigned depth)
 {
+    return true;
     TCGOp *def;
 
     if (depth > 8) {
