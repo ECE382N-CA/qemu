@@ -3828,7 +3828,8 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
 
     for (body_op = QTAILQ_NEXT(mb_op, link); body_count-- > 0;
          body_op = QTAILQ_NEXT(body_op, link)) {
-        if (body_op->opc == INDEX_op_insn_start) {
+        if (body_op->opc == INDEX_op_insn_start ||
+	    body_op->opc == INDEX_op_mb) {
             continue;
         }
         cursor = tcg_tm_clone_after(s, cursor, body_op);
