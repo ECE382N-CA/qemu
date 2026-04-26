@@ -3711,6 +3711,7 @@ static bool tcg_tm_is_body_op(TCGOp *op)
         return tcg_tm_args_are_guest_only(op, 2);
     case INDEX_op_mb:
     case INDEX_op_insn_start:
+    case INDEX_op_discard:
         return true;
     default:
         return false;
