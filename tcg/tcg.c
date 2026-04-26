@@ -3777,17 +3777,23 @@ static TCGOp *tcg_tm_find_body_end(TCGOp *mb_op, unsigned *count)
     return body_end;
 }
 
-static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
-                                               TCGOp *body_end,
-                                               unsigned body_count,
-                                               uint64_t pc_start)
+static TCGOp *tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
+                                                 TCGOp *body_end,
+                                                 unsigned body_count,
+                                                 uint64_t pc_start)
 {
     const TCGTMConfig *cfg = tcg_tm_get_config();
-    const unsigned cloned_body_count = body_count;
+    unsigned cloned_body_count = 0;
     TCGLabel *fallback = gen_new_label();
     TCGLabel *done = gen_new_label();
     TCGv_i64 ret = tcg_temp_new_i64();
     TCGOp *op, *cursor, *body_op;
+    /*
+     * Save the first original op after the absorbed region before we insert
+     * labels after @body_end, so the outer scan can resume past this
+     * transaction and avoid rescanning later barriers folded into it.
+     */
+    TCGOp *resume_at = QTAILQ_NEXT(body_end, link);
 
     /*
      * TSTART returns zero on the successful transactional path.  Keep the
@@ -3829,10 +3835,11 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
     for (body_op = QTAILQ_NEXT(mb_op, link); body_count-- > 0;
          body_op = QTAILQ_NEXT(body_op, link)) {
         if (body_op->opc == INDEX_op_insn_start ||
-	    body_op->opc == INDEX_op_mb) {
+            body_op->opc == INDEX_op_mb) {
             continue;
         }
         cursor = tcg_tm_clone_after(s, cursor, body_op);
+        cloned_body_count++;
     }
 
     /*
@@ -3877,6 +3884,8 @@ static void tcg_tm_insert_seq_barrier_fastpath(TCGContext *s, TCGOp *mb_op,
                       pc_start, mb_op->args[0], cloned_body_count,
                       cfg->force_cancel ? "force-cancel" : "commit");
     }
+
+    return resume_at;
 }
 
 void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
@@ -3906,6 +3915,7 @@ void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
     QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
         unsigned body_count;
         TCGOp *body_end;
+        TCGOp *resume_at;
 
         switch (op->opc) {
         // =========================
@@ -3919,8 +3929,11 @@ void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
                         tcg_tm_log_ops(s, pc_start, "pre-rewrite ops");
                         dumped_pre_rewrite = true;
                     }
-                    tcg_tm_insert_seq_barrier_fastpath(s, op, body_end,
-                                                       body_count, pc_start);
+                    resume_at = tcg_tm_insert_seq_barrier_fastpath(s, op,
+                                                                   body_end,
+                                                                   body_count,
+                                                                   pc_start);
+                    next = resume_at;
                     tcg_tm_log_ops(s, pc_start, "post-rewrite ops");
                 } else {
                     tcg_tm_log_event("TME: leave tb=%016" PRIx64
@@ -7367,4 +7380,3 @@ void tcg_expand_vec_op(TCGOpcode o, TCGType t, unsigned e, TCGArg a0, ...)
     g_assert_not_reached();
 }
 #endif
-
