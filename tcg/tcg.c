@@ -3746,11 +3746,11 @@ static TCGOp *tcg_tm_clone_after(TCGContext *s, TCGOp *insert_after, TCGOp *src)
     return clone;
 }
 
-static TCGOp *tcg_tm_find_body_end(TCGOp *mb_op, unsigned *count)
+static TCGOp *tcg_tm_find_body_end(TCGOp *mb_op, unsigned *op_count, unsigned *barrier_count)
 {
     TCGOp *body_end = mb_op;
     TCGOp *op = QTAILQ_NEXT(mb_op, link);
-    unsigned n = 0;
+    unsigned cnt = 0, barrier_cnt = 0;
     bool seen_memory_op = false;
     bool seen_store_op = false;
 
@@ -3762,19 +3762,24 @@ static TCGOp *tcg_tm_find_body_end(TCGOp *mb_op, unsigned *count)
         if (tcg_tm_is_region_boundary(op) || !tcg_tm_is_body_op(op)) {
             break;
         }
+        if (op->opc == INDEX_op_mb) {
+            barrier_cnt += 1;
+        }
         seen_memory_op |= tcg_tm_is_memory_body_op(op->opc);
         seen_store_op |= tcg_tm_is_store_body_op(op->opc);
         body_end = op;
-        n++;
+        cnt++;
         op = QTAILQ_NEXT(op, link);
     }
 
     if (!seen_memory_op || !seen_store_op) {
-        *count = 0;
+        *op_count = 0;
+        *barrier_count = 0;
         return mb_op;
     }
 
-    *count = n;
+    *op_count = cnt;
+    *barrier_count = barrier_cnt;
     return body_end;
 }
 
@@ -3914,7 +3919,7 @@ void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
     TCGOp *op, *next;
 
     QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
-        unsigned body_count;
+        unsigned body_count, barrier_count = 0;
         TCGOp *body_end;
         TCGOp *resume_at;
 
@@ -3924,8 +3929,8 @@ void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
         // =========================
         case INDEX_op_mb:
             if (tcg_tm_is_seq_barrier(op->args[0])) {
-                body_end = tcg_tm_find_body_end(op, &body_count);
-                if (body_count != 0) {
+                body_end = tcg_tm_find_body_end(op, &body_count, &barrier_count);
+                if (body_count >= 5 && barrier_count >= 2) {
                     if (!dumped_pre_rewrite) {
                         tcg_tm_log_ops(s, pc_start, "pre-rewrite ops");
                         dumped_pre_rewrite = true;
