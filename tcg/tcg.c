@@ -3750,7 +3750,7 @@ static TCGOp *tcg_tm_find_body_end(TCGOp *mb_op, unsigned *op_count, unsigned *b
 {
     TCGOp *body_end = mb_op;
     TCGOp *op = QTAILQ_NEXT(mb_op, link);
-    unsigned cnt = 0, barrier_cnt = 0;
+    unsigned cnt = 0, barrier_cnt = 1;
     bool seen_memory_op = false;
     bool seen_store_op = false;
 
