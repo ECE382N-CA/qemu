@@ -3714,7 +3714,7 @@ static bool tcg_tm_is_body_op(TCGOp *op)
     case INDEX_op_discard:
         return true;
     default:
-        return false;
+        return true;
     }
 }
 
@@ -3944,8 +3944,9 @@ void tcg_gen_tm(TCGContext *s, uint64_t pc_start)
                 } else {
                     tcg_tm_log_event("TME: leave tb=%016" PRIx64
                                      " flags=0x%" TCG_PRIlx
-                                     " reason=no-eligible-body\n",
-                                     pc_start, op->args[0]);
+                                     " reason=no-eligible-body"
+                                     " (body_cnt=%u, barrier_cnt=%u)\n",
+                                     pc_start, op->args[0], body_count, barrier_count);
                     if (cfg->debug && qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)) {
                         qemu_log_mask(CPU_LOG_TB_OP_OPT,
                                       "TME: leave seq barrier without body"
